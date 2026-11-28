@@ -1,0 +1,49 @@
+# Reusable level-1 workflow of every app repository (guide 501, DEL-CI-002).
+# An app's .github/workflows/ci.yml calls it, pinned to a commit SHA of this
+# repository; Renovate bumps the SHA. Every step is `just ci` in the CI image,
+# with MariaDB and Redis as job services.
+name: "CI · App · L1 checks (reusable)"
+
+on:
+  workflow_call:
+    secrets:
+      APPS_READ_TOKEN:
+        description: Read access to the private app repositories and this one
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  level1:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/fabiotessaro/ci:1ca35f6b7863
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user root
+    services:
+      mariadb:
+        image: docker.io/mariadb:11.8@sha256:73c35e8483b56390cc98f8d6d9840244bd03c929aea7109490641b9389a18088
+        env:
+          MARIADB_ROOT_PASSWORD: ci-root
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-retries 30
+      redis-cache:
+        image: docker.io/redis:8.12.0-alpine@sha256:5af80107c1eeecb484a2269b80a26d12bfa6521787da4663bd9f19f60a163483
+      redis-queue:
+        image: docker.io/redis:8.12.0-alpine@sha256:5af80107c1eeecb484a2269b80a26d12bfa6521787da4663bd9f19f60a163483
+    env:
+      APPS_READ_TOKEN: ${{ secrets.APPS_READ_TOKEN }}
+      CI_DB_HOST: mariadb
+      CI_DB_ROOT_PASSWORD: ci-root
+      CI_REDIS_CACHE: redis://redis-cache:6379
+      CI_REDIS_QUEUE: redis://redis-queue:6379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: just ci

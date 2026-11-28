@@ -1,0 +1,68 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Shared Renovate preset of every repository of FabioTessaro (extend it with local>FabioTessaro/tcf_platform)",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests", ":semanticCommitTypeAll(chore)"],
+  "dependencyDashboard": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool versions in Dockerfiles annotated with '# renovate:'",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+ARG \\S+?_VERSION=(?<currentValue>\\S+)"
+      ],
+      "extractVersionTemplate": "{{#if extractVersion}}{{{extractVersion}}}{{else}}^v?(?<version>.*)${{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Apps in platform.lock: tag and commit",
+      "managerFilePatterns": ["/(^|/)platform\\.lock$/"],
+      "matchStrings": [
+        "repository = \"(?<packageName>[^\"]+)\"\\s+version = \"(?<currentValue>[^\"]+)\"\\s+commit = \"(?<currentDigest>[0-9a-f]{40})\""
+      ],
+      "datasourceTemplate": "git-tags",
+      "depNameTemplate": "{{{packageName}}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Pinned platform commit of app repositories (shared configuration, DEL-TOOL-003)",
+      "managerFilePatterns": ["/(^|/)justfile$/"],
+      "matchStrings": ["platform_ref := \"(?<currentDigest>[0-9a-f]{40})\""],
+      "datasourceTemplate": "git-refs",
+      "packageNameTemplate": "https://github.com/FabioTessaro/tcf_platform",
+      "depNameTemplate": "tcf_platform",
+      "currentValueTemplate": "main"
+    },
+    {
+      "customType": "regex",
+      "description": "Versions in justfiles annotated with '# renovate:' (tools run with uvx)",
+      "managerFilePatterns": ["/(^|/)justfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\S+ := \"(?<currentValue>[^\"]+)\""
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Renovate itself, run by `just renovate`",
+      "managerFilePatterns": ["/(^|/)justfile$/"],
+      "matchStrings": ["npx -y renovate@(?<currentValue>[0-9][^\\s]*)"],
+      "datasourceTemplate": "npm",
+      "depNameTemplate": "renovate"
+    },
+    {
+      "customType": "regex",
+      "description": "just on GitHub runners, outside the CI image",
+      "managerFilePatterns": ["/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["just\\.systems/install\\.sh \\| bash -s -- --tag (?<currentValue>[0-9][^\\s]*)"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "casey/just"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "One pull request per platform commit bump (workflow SHA and shared configuration together)",
+      "matchDepNames": ["tcf_platform", "FabioTessaro/tcf_platform"],
+      "groupName": "platform"
+    }
+  ]
+}

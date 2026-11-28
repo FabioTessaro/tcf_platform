@@ -1,0 +1,566 @@
+# Recipes of the platform repository (guide 501). `just` lists them.
+#
+# Every public recipe runs inside the CI image: on a developer machine `just`
+# starts it with `docker run` (Docker access needed: run on the host), in CI the
+# job already runs in it (FRAPPE_CI_IMAGE=1). Same tools, same result
+# (DEL-TOOL-004). Build the image locally once with `just ci-image-build`.
+#
+# Pre-production: steps with nothing to act on yet print "inactive: <reason>"
+# and pass (docs/adr/0001-pre-production-inactive-steps.md).
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+owner := "FabioTessaro"
+# Image names must be lowercase (GitHub owner and repository names may not be).
+image_owner := "fabiotessaro"
+ci_tag := `sha256sum ci-image/Dockerfile | cut -c1-12`
+ci_image := "ghcr.io/" + image_owner + "/ci:" + ci_tag
+platform_image := "ghcr.io/" + image_owner + "/tcf_platform"
+lock := "platform.lock"
+in_ci_image := env("FRAPPE_CI_IMAGE", "")
+cache_volume := "platform-ci-cache"
+
+# List the recipes
+default:
+    @just --list
+
+# --- setup and the CI image (host) --------------------------------------------
+
+# Install the git hooks of this repository
+setup:
+    pre-commit install
+    pre-commit install-hooks
+
+# Build the CI image locally (tag = hash of ci-image/Dockerfile)
+ci-image-build:
+    docker build --pull -t {{ ci_image }} ci-image
+
+# Delete build outputs, the app checkouts of the checks and the tool-cache volume
+clean:
+    rm -rf dist .cache
+    -docker volume rm {{ cache_volume }}
+
+# Print the CI image reference
+ci-image:
+    @echo {{ ci_image }}
+
+# Publish the CI image unless this tag is already in the registry (CI, on main)
+ci-image-publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if docker manifest inspect {{ ci_image }} >/dev/null 2>&1; then
+      echo "{{ ci_image }} is already published"
+    else
+      docker build --pull -t {{ ci_image }} ci-image
+      docker push {{ ci_image }}
+    fi
+
+# Point every workflow at the current CI image tag (after editing ci-image/Dockerfile)
+pin-ci-image:
+    sed -i -E 's#ghcr\.io/{{ image_owner }}/ci:[0-9a-f]+#{{ ci_image }}#g' .github/workflows/*.yml
+    @echo "workflows now use {{ ci_image }}"
+
+# --- level 1: this repository's checks ----------------------------------------
+
+# Format Python and fix whitespace (rerun `just lint` after)
+fmt: (_in "_fmt")
+
+# Every git hook on every file
+lint: (_in "_lint")
+
+# mypy on the Python tools
+typecheck: (_in "_typecheck")
+
+# Copy shared-config/ files that apply to this repository into place
+sync-config: (_in "_sync-config")
+
+# Fail if a copy differs from shared-config/, or a workflow uses another CI image tag
+check-config: (_in "_check-config")
+
+# Run every generator (this repository has none)
+generate: (_in "_generate")
+
+# `just generate`, then fail if a tracked file changed
+check-generated: (_in "_check-generated")
+
+# Schema and error-catalog diff against the last release (not applicable here: ADR 0002)
+api-diff: (_in "_api-diff")
+
+# Structure of platform.lock
+check-lock: (_in "_check-lock")
+
+# Unit tests of the tools
+test-unit: (_in "_test-unit")
+
+# gitleaks over the history, Trivy over the files (vulnerabilities, licences)
+scan: (_in "_scan")
+
+# What CI runs on every pull request
+ci: (_in "_ci")
+
+# --- level 2: the platform -----------------------------------------------------
+
+# Every tag of platform.lock exists and points to the locked commit
+check-lock-remote: (_in "_check-lock-remote")
+
+# Build the platform image from platform.lock
+build-image: (_in "_build-image")
+
+# Cross-app contracts on the apps of platform.lock
+test-platform: (_in "_test-platform")
+
+# Backend tests of every app on the disposable stack (site=full)
+test-backend site="full": (_in "_test-backend" site)
+
+# End-to-end tests (Playwright) on the disposable stack
+test-e2e: (_in "_test-e2e")
+
+# CycloneDX SBOM of the platform image (Syft)
+sbom: (_in "_sbom")
+
+# Trivy on the platform image: fails on fixable critical/high findings
+scan-image: (_in "_scan-image")
+
+# Push the image built from main as release candidate main-<sha>, signed, with its SBOM attested
+sign: (_in "_sign")
+
+# Level-2 sequence (on platform.lock changes, nightly and on main)
+level2: (_in "_level2")
+
+# --- releases and deploys ------------------------------------------------------
+
+# Make platform release VERSION (YYYY.MM.PATCH): promote main's release candidate, notes, tag
+release version: (_in "_release" version)
+
+# Deploy release VERSION to ENV (staging | production)
+deploy env version: (_in "_deploy" env version)
+
+# Roll ENV back to the version before the last deploy, restoring that deploy's backup
+rollback env: (_in "_rollback" env)
+
+# --- maintenance ---------------------------------------------------------------
+
+# Renovate over every repository of the owner (needs RENOVATE_TOKEN)
+renovate: (_in "_renovate")
+
+# ==============================================================================
+# Implementation (runs inside the CI image)
+# ==============================================================================
+
+[private]
+_in recipe *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "{{ in_ci_image }}" == 1 ]]; then exec just {{ recipe }} {{ args }}; fi
+    command -v docker >/dev/null || { echo "Docker is needed to run recipes in the CI image (run this on the host)." >&2; exit 1; }
+    if ! docker image inspect {{ ci_image }} >/dev/null 2>&1 && ! docker pull -q {{ ci_image }} >/dev/null 2>&1; then
+      echo "CI image {{ ci_image }} not available: run 'just ci-image-build' first." >&2; exit 1
+    fi
+    # Tool caches (pre-commit environments, Trivy database, …) live in a volume,
+    # not in the checkout: some of them are read-only files.
+    if ! docker volume inspect {{ cache_volume }} >/dev/null 2>&1; then
+      docker volume create {{ cache_volume }} >/dev/null
+      docker run --rm -u 0 -v {{ cache_volume }}:/c {{ ci_image }} chown "$(id -u):$(id -g)" /c
+    fi
+    tty=(); [[ -t 1 ]] && tty=(-t)
+    # The host's git identity and SSH agent (git tag and push of `just release`).
+    extra=()
+    if name=$(git config user.name); then extra+=(-e "GIT_AUTHOR_NAME=$name"); fi
+    if email=$(git config user.email); then extra+=(-e "GIT_AUTHOR_EMAIL=$email"); fi
+    if [[ -S "${SSH_AUTH_SOCK:-}" ]]; then
+      extra+=(-v "$SSH_AUTH_SOCK:/run/ssh-agent" -e SSH_AUTH_SOCK=/run/ssh-agent -e "GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new")
+    fi
+    exec docker run --rm "${tty[@]}" "${extra[@]}" -v "$PWD:/w" -w /w -u "$(id -u):$(id -g)" \
+      --group-add "$(stat -c %g /var/run/docker.sock)" -v /var/run/docker.sock:/var/run/docker.sock \
+      -v {{ cache_volume }}:/c -e HOME=/c/home -e PRE_COMMIT_HOME=/c/pre-commit -e FRAPPE_CI_IMAGE=1 \
+      -e APPS_READ_TOKEN -e COSIGN_PRIVATE_KEY -e COSIGN_PASSWORD -e GITHUB_SHA \
+      -e DEPLOY_HOST -e DEPLOY_SSH_KEY -e RENOVATE_TOKEN -e GITHUB_ACTOR \
+      {{ ci_image }} just {{ recipe }} {{ args }}
+
+[private]
+_fmt:
+    -pre-commit run ruff-format --all-files
+    -pre-commit run trailing-whitespace --all-files
+    -pre-commit run end-of-file-fixer --all-files
+
+[private]
+_lint:
+    pre-commit run --all-files
+
+[private]
+_typecheck:
+    mypy --config-file mypy.ini tools
+
+# shared-config/files.txt lines for this repository (kind "all")
+[private]
+_config-files:
+    @awk '!/^#/ && NF == 3 && $3 == "all" {print $1, $2}' shared-config/files.txt
+
+[private]
+_sync-config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _config-files | while read -r src dest; do
+      mkdir -p "$(dirname "$dest")"; cp "shared-config/$src" "$dest"; echo "synced $dest"
+    done
+
+[private]
+_check-config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bad=0
+    while read -r src dest; do
+      cmp -s "shared-config/$src" "$dest" || { echo "$dest differs from shared-config/$src (run 'just sync-config')" >&2; bad=1; }
+    done < <(just _config-files)
+    if grep -rhoE 'ghcr\.io/{{ image_owner }}/ci:[0-9a-f]+' .github/workflows | grep -vxF '{{ ci_image }}' >&2; then
+      echo "workflows use another CI image tag than {{ ci_image }} (run 'just pin-ci-image')" >&2; bad=1
+    fi
+    exit "$bad"
+
+[private]
+_generate:
+    @echo "generate: this repository has no generators (ADR 0002)"
+
+[private]
+_check-generated: _generate
+    git diff --exit-code
+
+[private]
+_api-diff:
+    @echo "not applicable: api-diff — the platform repository has no API (ADR 0002)"
+
+[private]
+_check-lock:
+    python3 tools/lock.py check {{ lock }}
+
+[private]
+_test-unit:
+    python3 -m unittest discover -s tools/tests -t tools -v
+
+[private]
+_scan:
+    gitleaks git --redact --no-banner .
+    trivy fs --quiet --exit-code 1 --scanners vuln,license --severity HIGH,CRITICAL --ignore-unfixed --skip-dirs .cache .
+
+[private]
+_ci: _lint _check-config _check-lock _typecheck _check-generated _api-diff _test-unit _scan
+
+[private]
+_check-lock-remote:
+    python3 tools/lock.py check {{ lock }} --remote
+
+[private]
+_build-image: _check-lock
+    docker buildx build --load --secret id=git_token,env=APPS_READ_TOKEN \
+      -f docker/Dockerfile -t {{ platform_image }}:dev .
+
+[private]
+_test-platform:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "$(python3 tools/lock.py apps {{ lock }})" ]]; then echo "inactive: platform contracts — no app in platform.lock yet"; exit 0; fi
+    python3 tools/lock.py checkout {{ lock }} .cache/apps
+    python3 tools/contracts.py .cache/apps {{ lock }}
+
+# Disposable stack: compose/production.yml + compose/e2e.yml on the dev image.
+[private]
+_stack action:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export COMPOSE_PROJECT_NAME=platform-e2e PLATFORM_IMAGE={{ platform_image }}:dev
+    export DB_ROOT_PASSWORD=e2e-root ADMIN_PASSWORD=e2e-admin HTTP_PORT=8080
+    dc=(docker compose -f compose/production.yml -f compose/e2e.yml)
+    # Inside a container (CI job, or `just` through the CI image) the stack's ports
+    # are on the Docker host: join the stack's network and use the service names.
+    net=platform-e2e_default; inside=false; [[ -f /.dockerenv ]] && inside=true
+    case "{{ action }}" in
+      up) "${dc[@]}" up -d --wait --wait-timeout 600 db redis-cache redis-queue
+          "${dc[@]}" run --rm configurator
+          "${dc[@]}" run --rm create-site
+          "${dc[@]}" up -d --wait --wait-timeout 600
+          if [[ $inside == true ]]; then docker network connect "$net" "$(hostname)"; fi ;;
+      down) if [[ $inside == true ]]; then docker network disconnect "$net" "$(hostname)" 2>/dev/null || true; fi
+          "${dc[@]}" down -v --remove-orphans ;;
+      *) "${dc[@]}" exec -T backend bash -c "{{ action }}" ;;
+    esac
+
+[private]
+_test-backend site:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    apps=$(python3 tools/lock.py apps {{ lock }})
+    if [[ -z "$apps" ]]; then echo "inactive: backend tests (site={{ site }}) — no app in platform.lock yet"; exit 0; fi
+    [[ "{{ site }}" == full ]] || { echo "site={{ site }}: the platform runs the full site only" >&2; exit 1; }
+    trap 'just _stack down' EXIT
+    just _stack up
+    for app in $apps; do just _stack "bench --site e2e.localhost run-tests --app $app"; done
+
+[private]
+_test-e2e:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "$(python3 tools/lock.py apps {{ lock }})" ]]; then echo "inactive: end-to-end tests — no app in platform.lock yet"; exit 0; fi
+    core=$(python3 tools/lock.py core {{ lock }})
+    python3 tools/lock.py checkout {{ lock }} .cache/apps
+    if [[ -z "$core" || ! -f ".cache/apps/$core/frontend/playwright.config.ts" ]]; then
+      echo "inactive: end-to-end tests — no core app with a Playwright configuration yet"; exit 0
+    fi
+    trap 'just _stack down' EXIT
+    just _stack up
+    cd ".cache/apps/$core/frontend"
+    yarn install --frozen-lockfile
+    yarn playwright install chromium
+    base=http://localhost:8080; [[ -f /.dockerenv ]] && base=http://frontend:8080
+    E2E_BASE_URL="$base" E2E_ADMIN_PASSWORD=e2e-admin yarn playwright test
+
+[private]
+_sbom:
+    mkdir -p dist
+    syft {{ platform_image }}:dev -o cyclonedx-json=dist/sbom.cdx.json
+    @echo "dist/sbom.cdx.json"
+
+[private]
+_scan-image:
+    trivy image --quiet --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed {{ platform_image }}:dev
+
+# The release candidate (DEL-REL-005): the image level 2 just built and tested,
+# pushed as main-<sha> and signed by digest, with the SBOM as a signed
+# attestation. `just release` promotes it without rebuilding.
+[private]
+_sign:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${COSIGN_PRIVATE_KEY:-}" ]]; then
+      echo "inactive: signing — COSIGN_PRIVATE_KEY is not set (no releases yet)"; exit 0
+    fi
+    [[ -f dist/sbom.cdx.json ]] || { echo "dist/sbom.cdx.json is missing: run level 2 first" >&2; exit 1; }
+    ref={{ platform_image }}:main-${GITHUB_SHA:-$(git rev-parse HEAD)}
+    docker tag {{ platform_image }}:dev "$ref"
+    docker push -q "$ref"
+    digest=$(docker buildx imagetools inspect "$ref" | awk '/^Digest:/ {print $2; exit}')
+    img={{ platform_image }}@$digest
+    cosign sign --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY "$img"
+    cosign attest --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY --type cyclonedx --predicate dist/sbom.cdx.json "$img"
+    echo "release candidate $ref ($digest)"
+
+[private]
+_level2: _check-lock-remote _build-image _test-platform (_test-backend "full") _test-e2e _sbom _scan-image
+
+[private]
+_renovate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${RENOVATE_TOKEN:-}" ]]; then echo "inactive: Renovate — RENOVATE_TOKEN is not set"; exit 0; fi
+    RENOVATE_PLATFORM=github RENOVATE_AUTODISCOVER=true RENOVATE_AUTODISCOVER_FILTER='{{ owner }}/*' \
+      npx -y renovate@45.3.2
+
+# Promote the release candidate of main's HEAD (DEL-REL-005): the exact image
+# level 2 tested, re-scanned for vulnerabilities found since. The version tag
+# points to the same digest, so the signature and the SBOM attestation made on
+# main apply to it unchanged: no rebuild, no new signature.
+[private]
+_release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail() { echo "release {{ version }}: $*" >&2; exit 1; }
+    [[ "{{ version }}" =~ ^[0-9]{4}\.(0[1-9]|1[0-2])\.[0-9]+$ ]] || fail "the version must be YYYY.MM.PATCH (DEL-REL)"
+    [[ -n "$(python3 tools/lock.py core {{ lock }})" ]] || fail "no core app in platform.lock yet: nothing to release"
+    [[ -f cosign.pub ]] || fail "cosign.pub (the organisation's public signing key) is not in the repository"
+    [[ "$(git rev-parse --abbrev-ref HEAD)" == main && -z "$(git status --porcelain)" ]] || fail "release from a clean main"
+    git rev-parse -q --verify "refs/tags/{{ version }}" >/dev/null && fail "tag {{ version }} already exists"
+    sha=$(git rev-parse HEAD)
+    candidate={{ platform_image }}:main-$sha
+    digest=$(docker buildx imagetools inspect "$candidate" 2>/dev/null | awk '/^Digest:/ {print $2; exit}' || true)
+    [[ -n "$digest" ]] || fail "no release candidate $candidate: level 2 has not passed on this commit of main (re-run it)"
+    img={{ platform_image }}@$digest
+    cosign verify --insecure-ignore-tlog=true --key cosign.pub "$img" >/dev/null || fail "$candidate is not signed with cosign.pub"
+    mkdir -p dist
+    cosign verify-attestation --insecure-ignore-tlog=true --key cosign.pub --type cyclonedx "$img" \
+      | jq -r .payload | base64 -d | jq .predicate > dist/sbom.cdx.json \
+      || fail "$candidate has no signed SBOM attestation"
+    # Vulnerabilities published since level 2 ran (and since the last nightly run).
+    trivy image --quiet --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$img" \
+      || fail "$candidate has fixable critical/high vulnerabilities: fix them on main, then release"
+    docker buildx imagetools create -t {{ platform_image }}:{{ version }} "$img"
+    git-cliff --tag {{ version }} -o dist/release-notes.md
+    # The CI image has no git identity: the tagger is whoever started the release.
+    actor=${GITHUB_ACTOR:-release}
+    git -c user.name="${GIT_AUTHOR_NAME:-$actor}" -c user.email="${GIT_AUTHOR_EMAIL:-$actor@users.noreply.github.com}" \
+      tag -a {{ version }} -m "platform release {{ version }} ($digest)"
+    git push origin {{ version }}
+    echo "released {{ platform_image }}:{{ version }} = $candidate ($digest); SBOM and notes in dist/"
+
+# Deploy state on the host, in /srv/platform/<env>/ (DEL-CD-004):
+#   .env.sops        the environment, SOPS-encrypted (DEL-CD-005); each run
+#                    decrypts it into /dev/shm and removes it on exit
+#   current-version  the version running, written once its smoke test passes
+#   rollback.env     written by a deploy right after its backup: PREVIOUS_VERSION,
+#                    BACKUP_ID, DEPLOYED_VERSION. `just rollback` consumes it; a
+#                    deploy refuses to start while the last one did not finish.
+# Host scripts: deploy/host/backup.sh prints the backup ID on its last line;
+# deploy/host/restore.sh ID restores that database backup and object-store
+# snapshot (guide 503, 601). Each deploy copies the released version's scripts
+# to the host before its backup, so a rollback restores with the script that
+# matches the backup. Placeholders that fail until implemented (conformance.md).
+[private]
+_deploy env version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail() { echo "deploy {{ env }}: $*" >&2; exit 1; }
+    [[ "{{ env }}" == staging || "{{ env }}" == production ]] || fail "env must be staging or production"
+    [[ -n "${DEPLOY_HOST:-}" && -n "${DEPLOY_SSH_KEY:-}" ]] || fail "DEPLOY_HOST and DEPLOY_SSH_KEY are not set for this environment"
+    [[ -f cosign.pub ]] || fail "cosign.pub (the organisation's public signing key) is not in the repository"
+    git rev-parse -q --verify "refs/tags/{{ version }}" >/dev/null || fail "no git tag {{ version }} (fetch the tags, or release it first)"
+    ref={{ platform_image }}:{{ version }}
+    core=$(python3 tools/lock.py core {{ lock }}); [[ -n "$core" ]] || fail "no core app in platform.lock"
+    # 2. Verify the signature (DEL-CD-003).
+    cosign verify --insecure-ignore-tlog=true --key cosign.pub "$ref" >/dev/null
+    # The audit step (8) must be able to run before anything changes on the host.
+    docker pull -q "$ref" >/dev/null
+    docker run --rm "$ref" env/bin/python -c "import $core.sdk.audit as a; a.record_deploy" 2>/dev/null \
+      || fail "$core.sdk.audit.record_deploy is missing in $ref (the deploy Audit Event is mandatory)"
+    key=$(mktemp); compose=$(mktemp); changed=0; envf=""
+    on_exit() {
+      local rc=$?
+      if [[ -n "$envf" ]]; then ssh_ "rm -f $envf" || true; fi
+      rm -f "$key" "$compose"
+      if [[ $rc -ne 0 && $changed == 1 ]]; then
+        echo "deploy {{ env }}: failed after the backup. Roll back: workflow 'CD · Platform · Rollback' or 'just rollback {{ env }}' (DEL-CD-004)" >&2
+      fi
+    }
+    trap on_exit EXIT
+    printf '%s\n' "$DEPLOY_SSH_KEY" > "$key"; chmod 600 "$key"
+    ssh_() { ssh -i "$key" -o StrictHostKeyChecking=accept-new "$DEPLOY_HOST" "$@"; }
+    # 7. Smoke test: every site answers through its own host name (retried while
+    #    gunicorn starts). Login and one journey per app: open (docs/conformance.md).
+    smoke() {
+      ssh_ "$1 exec -T backend bash -s" <<'SMOKE'
+    set -euo pipefail
+    n=0
+    for c in sites/*/site_config.json; do
+      [[ -f "$c" ]] || continue
+      s=${c#sites/}; s=${s%/site_config.json}; ok=0
+      for _ in $(seq 30); do
+        if curl -fs -o /dev/null -H "Host: $s" http://localhost:8000/api/method/ping; then ok=1; break; fi
+        sleep 2
+      done
+      (( ok )) || { echo "smoke: $s does not answer" >&2; exit 1; }
+      n=$((n + 1))
+    done
+    (( n > 0 )) || { echo "smoke: no site" >&2; exit 1; }
+    echo "smoke: $n site(s) answer"
+    SMOKE
+    }
+    dir=/srv/platform/{{ env }}
+    ssh_ "test -d $dir" || fail "$dir does not exist on $DEPLOY_HOST"
+    previous=$(ssh_ "cat $dir/current-version 2>/dev/null || true")
+    # A deploy that failed after its backup leaves the host half-changed: roll it
+    # back first, or the next backup would capture that state.
+    pending=$(ssh_ "sed -n 's/^DEPLOYED_VERSION=//p' $dir/rollback.env 2>/dev/null || true")
+    [[ -z "$pending" || "$pending" == "$previous" ]] \
+      || fail "the deploy of $pending did not finish: roll back first (just rollback {{ env }})"
+    # The compose file of the release itself, not of the checked-out branch.
+    git show "{{ version }}:compose/production.yml" > "$compose"
+    # The released version's host scripts: the backup and the rollback's restore
+    # must come from the same version (DEL-CD-007).
+    for script in backup restore; do
+      git show "{{ version }}:deploy/host/$script.sh" | ssh_ "cat > $dir/$script.sh.new && chmod 755 $dir/$script.sh.new && mv $dir/$script.sh.new $dir/$script.sh" \
+        || fail "could not install deploy/host/$script.sh of {{ version }} on $DEPLOY_HOST"
+    done
+    # The environment is SOPS-encrypted on the host (DEL-CD-005): decrypted with
+    # the host's age key into memory, for this run only (removed on exit).
+    envf=/dev/shm/platform-{{ env }}.env
+    ssh_ "umask 077 && sops -d --input-type dotenv --output-type dotenv $dir/.env.sops > $envf" \
+      || fail "could not decrypt $dir/.env.sops on $DEPLOY_HOST (sops and the host's age key are needed)"
+    dc="cd $dir && PLATFORM_IMAGE=$ref docker compose -f compose.yml --env-file $envf"
+    # 3. Encrypted backup of the database and object-store snapshot (DEL-CD-003; host script, guide 601).
+    backup_id=$(ssh_ "$dir/backup.sh" | tail -n 1) || fail "$dir/backup.sh failed: nothing was changed (backup before deploy is mandatory)"
+    [[ "$backup_id" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "$dir/backup.sh did not print a backup ID on its last line (got '$backup_id')"
+    ssh_ "printf 'PREVIOUS_VERSION=%s\nBACKUP_ID=%s\nDEPLOYED_VERSION=%s\n' '$previous' '$backup_id' '{{ version }}' > $dir/rollback.env"
+    changed=1
+    scp -q -i "$key" -o StrictHostKeyChecking=accept-new "$compose" "$DEPLOY_HOST:$dir/compose.yml"
+    # 4. Pull. 5. Migrate in a one-off container. 6. Replace the services.
+    ssh_ "$dc pull"
+    ssh_ "$dc run --rm backend bench --site all migrate"
+    ssh_ "$dc up -d --remove-orphans --wait"
+    # 7. Smoke test.
+    smoke "$dc" || fail "smoke test failed"
+    ssh_ "echo '{{ version }}' > $dir/current-version"
+    # 8. Audit Event (DEL-CD-003).
+    ssh_ "$dc exec -T backend bench --site all execute $core.sdk.audit.record_deploy --kwargs \"{'version': '{{ version }}', 'actor': '${GITHUB_ACTOR:-$USER}'}\""
+    echo "deployed {{ version }} to {{ env }} (backup $backup_id; rollback target: ${previous:-none, first deploy})"
+
+# Rollback (DEL-CD-004): the previous image plus the restore of the backup taken
+# by the last deploy. Data written since that backup is lost.
+[private]
+_rollback env:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail() { echo "rollback {{ env }}: $*" >&2; exit 1; }
+    [[ "{{ env }}" == staging || "{{ env }}" == production ]] || fail "env must be staging or production"
+    [[ -n "${DEPLOY_HOST:-}" && -n "${DEPLOY_SSH_KEY:-}" ]] || fail "DEPLOY_HOST and DEPLOY_SSH_KEY are not set for this environment"
+    [[ -f cosign.pub ]] || fail "cosign.pub (the organisation's public signing key) is not in the repository"
+    core=$(python3 tools/lock.py core {{ lock }}); [[ -n "$core" ]] || fail "no core app in platform.lock"
+    key=$(mktemp); compose=$(mktemp); envf=""
+    trap 'if [[ -n "$envf" ]]; then ssh_ "rm -f $envf" || true; fi; rm -f "$key" "$compose"' EXIT
+    printf '%s\n' "$DEPLOY_SSH_KEY" > "$key"; chmod 600 "$key"
+    ssh_() { ssh -i "$key" -o StrictHostKeyChecking=accept-new "$DEPLOY_HOST" "$@"; }
+    # 7. Smoke test: every site answers through its own host name (retried while
+    #    gunicorn starts). Login and one journey per app: open (docs/conformance.md).
+    smoke() {
+      ssh_ "$1 exec -T backend bash -s" <<'SMOKE'
+    set -euo pipefail
+    n=0
+    for c in sites/*/site_config.json; do
+      [[ -f "$c" ]] || continue
+      s=${c#sites/}; s=${s%/site_config.json}; ok=0
+      for _ in $(seq 30); do
+        if curl -fs -o /dev/null -H "Host: $s" http://localhost:8000/api/method/ping; then ok=1; break; fi
+        sleep 2
+      done
+      (( ok )) || { echo "smoke: $s does not answer" >&2; exit 1; }
+      n=$((n + 1))
+    done
+    (( n > 0 )) || { echo "smoke: no site" >&2; exit 1; }
+    echo "smoke: $n site(s) answer"
+    SMOKE
+    }
+    dir=/srv/platform/{{ env }}
+    state=$(ssh_ "cat $dir/rollback.env 2>/dev/null || true")
+    [[ -n "$state" ]] || fail "no $dir/rollback.env on $DEPLOY_HOST: no deploy to roll back"
+    get() { sed -n "s/^$1=//p" <<<"$state"; }
+    previous=$(get PREVIOUS_VERSION); backup_id=$(get BACKUP_ID); failed=$(get DEPLOYED_VERSION)
+    [[ -n "$previous" ]] || fail "$failed was the first deploy: there is no previous version to return to (restore by hand with $dir/restore.sh $backup_id)"
+    [[ "$previous" =~ ^[0-9]{4}\.(0[1-9]|1[0-2])\.[0-9]+$ ]] || fail "unexpected PREVIOUS_VERSION '$previous' in rollback.env"
+    [[ "$backup_id" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "unexpected BACKUP_ID '$backup_id' in rollback.env"
+    ssh_ "test -x $dir/restore.sh" || fail "$dir/restore.sh is missing on $DEPLOY_HOST"
+    git rev-parse -q --verify "refs/tags/$previous" >/dev/null || fail "no git tag $previous (fetch the tags)"
+    ref={{ platform_image }}:$previous
+    echo "rolling {{ env }} back from $failed to $previous, restoring backup $backup_id"
+    # Same guarantees as a deploy: a signed image only (DEL-CD-003).
+    cosign verify --insecure-ignore-tlog=true --key cosign.pub "$ref" >/dev/null
+    git show "$previous:compose/production.yml" > "$compose"
+    # The environment is SOPS-encrypted on the host (DEL-CD-005): decrypted with
+    # the host's age key into memory, for this run only (removed on exit).
+    envf=/dev/shm/platform-{{ env }}.env
+    ssh_ "umask 077 && sops -d --input-type dotenv --output-type dotenv $dir/.env.sops > $envf" \
+      || fail "could not decrypt $dir/.env.sops on $DEPLOY_HOST (sops and the host's age key are needed)"
+    # 1. Stop everything that runs the platform image, with the compose file in place
+    #    (the failed version's), so nothing writes during the restore.
+    ssh_ "cd $dir && PLATFORM_IMAGE=unused docker compose -f compose.yml --env-file $envf stop backend frontend websocket queue-short queue-long scheduler"
+    # 2. Restore the pre-deploy backup: database and object store together (OPS-BAK-001).
+    ssh_ "$dir/restore.sh '$backup_id'"
+    # 3. Start the previous image with its own compose file. No migrate: the
+    #    restored database is the one this version ran on.
+    scp -q -i "$key" -o StrictHostKeyChecking=accept-new "$compose" "$DEPLOY_HOST:$dir/compose.yml"
+    dc="cd $dir && PLATFORM_IMAGE=$ref docker compose -f compose.yml --env-file $envf"
+    ssh_ "$dc pull"
+    ssh_ "$dc up -d --remove-orphans --wait"
+    ssh_ "$dc exec -T backend bench --site all clear-cache"
+    # 4. Smoke test.
+    smoke "$dc" \
+      || fail "smoke test of $previous failed after the restore: the environment needs manual recovery"
+    ssh_ "echo '$previous' > $dir/current-version && mv $dir/rollback.env $dir/rollback.done-\$(date -u +%Y%m%dT%H%M%SZ)"
+    # 5. Audit Event: the restored database no longer holds the events written since the backup.
+    ssh_ "$dc exec -T backend bench --site all execute $core.sdk.audit.record_deploy --kwargs \"{'version': '$previous', 'actor': '${GITHUB_ACTOR:-$USER}'}\""
+    echo "rolled {{ env }} back to $previous (backup $backup_id restored; data written since that backup is lost)"

@@ -1,0 +1,39 @@
+# Platform release (guide 502, DEL-REL-005): promotes the release candidate
+# main-<sha> that level 2 built, tested and signed on main's HEAD to the version
+# tag (same digest, so same signature and SBOM attestation), after a fresh
+# vulnerability scan; then release notes and the git tag. Nothing is rebuilt and
+# no signing key is needed here.
+name: "CD · Platform · Release"
+run-name: "CD · Platform · Release · ${{ inputs.version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Platform version (YYYY.MM.PATCH)
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/fabiotessaro/ci:1ca35f6b7863
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user root
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - run: just release "$VERSION"
+        env:
+          VERSION: ${{ inputs.version }}

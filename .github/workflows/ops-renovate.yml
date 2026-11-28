@@ -1,0 +1,27 @@
+# Dependency updates for every repository of FabioTessaro (Renovate run as a
+# scheduled job, guide 504). Inactive until the RENOVATE_TOKEN secret exists.
+name: "Ops · All repos · Dependency updates (Renovate)"
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  renovate:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/fabiotessaro/ci:1ca35f6b7863
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user root
+    env:
+      RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: just renovate

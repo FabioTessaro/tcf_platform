@@ -1,0 +1,26 @@
+# Conformance
+
+This repository **targets** Platform Architecture Guide 1.8.0
+(`FND-CONF-001`). It switches to "Conforms to" when the list of open rules
+below is empty and CI passes (`FND-CONF-006`).
+
+## Open rules
+
+| Rule | What is missing | Closes when |
+|---|---|---|
+| DEL-REPO-002 | No app is in `platform.lock`, so nothing is releasable | The first app conforms and Renovate adds it |
+| DEL-REL-004 | No signing key (`sign` is inactive, ADR 0001) | `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD` secrets and `cosign.pub` exist |
+| DEL-CD-002, DEL-CD-003, DEL-CD-004, DEL-CD-007 | No staging or production host; `deploy/host/backup.sh` and `restore.sh` are placeholders that fail (no backup destination yet), so no deploy can pass its backup | `DEPLOY_HOST`, `DEPLOY_SSH_KEY` environment secrets exist; both scripts are implemented against an encrypted, off-host, immutable backup destination (OPS-BAK-001…003); the rollback has been rehearsed on staging |
+| DEL-CD-002 | The smoke test only checks that every site answers; guide 503 step 7 also asks for a login and one journey per app | A smoke user and a smoke check per app exist |
+| DEL-CI-001 | Level-2 test steps are inactive (ADR 0001) | An app is in `platform.lock` |
+
+## Implemented
+
+| Rule | Where |
+|---|---|
+| DEL-CI-002, DEL-CI-007 | `.github/workflows/` call `just` recipes only; actions pinned to a commit SHA |
+| DEL-CI-003 | `ci-image/Dockerfile`, every job runs in it |
+| DEL-TOOL-003 | `shared-config/`, `just sync-config`, `just check-config` |
+| DEL-TOOL-004 | `justfile`: every recipe runs in the CI image, locally too |
+| DEL-CD-001 | `docker/Dockerfile` is built only by `just build-image` in CI |
+| SYS-DEP-001…003, 006, CT-REG-003 | `tools/contracts.py` (`just test-platform`) |

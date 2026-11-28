@@ -1,0 +1,87 @@
+# tcf_platform
+
+Targets Platform Architecture Guide 1.8.0.
+
+The **platform repository**: it defines what a platform release is and how it is
+built, checked, released and deployed (guide chapter 500). Apps live in their own
+repositories; this one holds what they share.
+
+| Path | Holds |
+|---|---|
+| `platform.lock` | Frappe and every app, with repository URL, tag and commit SHA: the definition of a platform release |
+| `ci-image/` | The CI container image every repository's CI runs in (pinned tools) |
+| `shared-config/` | Tool configuration copied into every repository by `just sync-config` (DEL-TOOL-003) |
+| `.github/workflows/ci-platform.yml` | CI · Platform · L1 checks & CI image: this repository's checks and the CI image publication |
+| `.github/workflows/ci-platform-l2.yml` | CI · Platform · L2 integration: level-2 CI on pull requests that touch the lock, image, stack or level-2 recipes, on `main` and nightly; a push to `main` also pushes the signed release candidate `main-<sha>` |
+| `.github/workflows/ci-app.yml` | CI · App · L1 checks (reusable): the level-1 workflow app repositories call (DEL-CI-002) |
+| `.github/workflows/cd-release.yml` | CD · Platform · Release: promotes the release candidate of `main`'s HEAD to the version tag (no rebuild), after a fresh scan; notes and git tag (manual) |
+| `.github/workflows/cd-deploy.yml` | CD · Platform · Deploy: deploys a release to staging or production (manual, approved) |
+| `.github/workflows/cd-rollback.yml` | CD · Platform · Rollback: returns an environment to the version before its last deploy (manual, approved) |
+| `.github/workflows/ops-renovate.yml` | Ops · All repos · Dependency updates (Renovate): weekly, for every repository of the owner |
+| `docker/`, `compose/` | Production image and the production / end-to-end compose files |
+| `deploy/host/` | `backup.sh` and `restore.sh`, copied to the deploy host by each deploy (placeholders: not implemented yet) |
+| `tools/` | The Python behind the recipes (lock handling, platform contracts) |
+| `docs/adr/` | Decisions of this repository |
+
+## Working on it
+
+The checkout lives next to the bench, in `./platform` of the development
+environment, and is part of the
+VS Code workspace. Edit anywhere. Recipes that need Docker (`build-image`,
+`test-*`, `sbom`, `scan-image`) run **on the host**, because the development
+container has no Docker access.
+
+Every recipe runs inside the CI image, so a recipe gives the same result on your
+machine and in CI (DEL-TOOL-004). On the host, `just` starts the image for you
+with `docker run`; build it once with `just ci-image-build`.
+
+```bash
+just                 # list the recipes
+just ci              # this repository's checks
+just level2          # build the platform image and run the level-2 checks
+```
+
+## Pre-production
+
+Until the first app conforms and the first release is made, some steps have
+nothing to act on. They print `inactive: <reason>` and pass instead of failing
+(see `docs/adr/0001-pre-production-inactive-steps.md`). Running `just release` or
+`just deploy` by hand still fails, with the reason.
+
+## One-time settings on GitHub
+
+`new-platform.sh` applies what the GitHub plan allows and lists the rest. Check:
+
+- the CI image package `ghcr.io/fabiotessaro/ci` is **public** (it holds only public
+  tools), so every repository's CI can pull it;
+- Actions access: repositories of `FabioTessaro` may use this repository's workflows;
+- secrets: `RENOVATE_TOKEN` (Renovate), `APPS_READ_TOKEN` (CI reads the private app
+  repositories), `COSIGN_PRIVATE_KEY` and `COSIGN_PASSWORD` (signing),
+  `DEPLOY_SSH_KEY` and `DEPLOY_HOST` per environment (deploys). Steps whose secret
+  is missing stay inactive.
+
+## Deploy hosts
+
+Each environment lives in `/srv/platform/<env>/` on its host, with its environment
+file encrypted with SOPS (`.env.sops`; the host needs `sops` and its age key). Each deploy copies the released version's host scripts from
+`deploy/host/` next to it (guide 503, 601):
+
+- `backup.sh`: encrypted backup of the database plus an object-store snapshot;
+  prints the backup ID on its last line;
+- `restore.sh ID`: restores that backup, database and object store together.
+
+**Both are placeholders that fail**, because there is no backup destination yet:
+until they are implemented, every deploy stops at its backup, before changing
+anything.
+
+Right after its backup, `just deploy` records `rollback.env` (previous version,
+backup ID), and `current-version` once the smoke test passes. If a
+deploy fails after the backup, or a deployed version turns out bad, run
+**CD · Platform · Rollback** (`just rollback <env>`): it stops the platform,
+runs `restore.sh`, and starts the previous version again. Data written since the
+backup is lost. Until the environment is rolled back, the next deploy refuses to
+start. Rehearse it on staging every quarter (DEL-CD-004).
+
+## Licence
+
+AGPL-3.0 — see `LICENSE`.

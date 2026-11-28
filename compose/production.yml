@@ -1,0 +1,126 @@
+# Production and staging stack (guide 503, reference deployment). One compose
+# project per environment on the VPS; values come from the host's encrypted
+# environment file (DEL-CD-005), never from this repository.
+#   PLATFORM_IMAGE   signed platform image, e.g. ghcr.io/fabiotessaro/tcf_platform:2026.12.0
+#   DB_ROOT_PASSWORD MariaDB root password
+#   HTTP_PORT        port of the frontend (behind the TLS reverse proxy)
+# The reverse proxy (Caddy or nginx, SEC-BASE-004/007, SEC-RATE-005) is a
+# deployment choice and is not part of this file.
+name: ${COMPOSE_PROJECT_NAME:-platform}
+
+x-backend: &backend
+  image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE}
+  restart: unless-stopped
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+  depends_on:
+    configurator:
+      condition: service_completed_successfully
+
+services:
+  configurator:
+    image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE}
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache redis://redis-cache:6379;
+        bench set-config -g redis_queue redis://redis-queue:6379;
+        bench set-config -g redis_socketio redis://redis-queue:6379;
+        bench set-config -gp socketio_port 9000
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+
+  backend:
+    <<: *backend
+
+  frontend:
+    <<: *backend
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: $$host
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8080}:8080"
+
+  websocket:
+    <<: *backend
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+
+  queue-short:
+    <<: *backend
+    command: ["bench", "worker", "--queue", "short,default"]
+
+  queue-long:
+    <<: *backend
+    command: ["bench", "worker", "--queue", "long,default,short"]
+
+  scheduler:
+    <<: *backend
+    command: ["bench", "schedule"]
+
+  db:
+    image: docker.io/mariadb:11.8@sha256:73c35e8483b56390cc98f8d6d9840244bd03c929aea7109490641b9389a18088
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --log-bin=mysqld-bin
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD}
+      MARIADB_AUTO_UPGRADE: "1"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      retries: 30
+    volumes:
+      - db:/var/lib/mysql
+
+  redis-cache:
+    image: docker.io/redis:8.12.0-alpine@sha256:5af80107c1eeecb484a2269b80a26d12bfa6521787da4663bd9f19f60a163483
+    restart: unless-stopped
+
+  redis-queue:
+    image: docker.io/redis:8.12.0-alpine@sha256:5af80107c1eeecb484a2269b80a26d12bfa6521787da4663bd9f19f60a163483
+    restart: unless-stopped
+    volumes:
+      - redis-queue:/data
+
+  objects:
+    image: docker.io/chrislusf/seaweedfs:4.55@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9
+    restart: unless-stopped
+    command: ["server", "-s3", "-dir=/data"]
+    volumes:
+      - objects:/data
+
+  antivirus:
+    image: docker.io/clamav/clamav:1.5.5@sha256:64e30c0bf976198024deb3dc6d5cfe2485fb969c0f73549ba0fdb364b9469614
+    restart: unless-stopped
+    volumes:
+      - antivirus:/var/lib/clamav
+
+volumes:
+  sites:
+  logs:
+  db:
+  redis-queue:
+  objects:
+  antivirus:
